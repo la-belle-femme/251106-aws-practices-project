@@ -1,0 +1,158 @@
+name: Terraform CI/CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Workspace/environment"
+        type: choice
+        required: true
+        options: [dev, prod]
+        default: dev
+      action:
+        description: "Terraform action"
+        type: choice
+        required: true
+        options: [plan, apply, destroy]
+        default: plan
+  pull_request:
+    paths:
+      - "08-secure-cicd/terraform-cicd/**"
+  push:
+    branches: [main]
+    paths:
+      - "08-secure-cicd/terraform-cicd/**"
+
+env:
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: "true"
+  TF_WORKING_DIR: 08-secure-cicd/terraform-cicd
+  # Optional: pin TF version your lab uses
+  TF_VERSION: 1.7.5
+
+permissions:
+  id-token: write   # OIDC for AWS
+  contents: read
+
+jobs:
+  terraform:
+    name: Terraform (${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'auto' }})
+    runs-on: ubuntu-latest
+
+    # Optional: gate production applies using GitHub Environments (Settings → Environments)
+    # Uncomment to require approval before prod runs.
+    # environment: ${{ github.event_name == 'push' && 'prod' || (github.event_name == 'workflow_dispatch' && inputs.environment) || 'dev' }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select workspace (dev/prod)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform workspace select dev 2>/dev/null || terraform workspace new dev
+          terraform workspace select prod 2>/dev/null || terraform workspace new prod
+          # Choose workspace depending on event
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            terraform workspace select "${{ inputs.environment }}"
+          elif [[ "${{ github.event_name }}" == "push" ]]; then
+            terraform workspace select prod
+          else
+            terraform workspace select dev
+          fi
+          echo "Using workspace: $(terraform workspace show)"
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          cli_config_credentials_token: ""  # not needed; using AWS OIDC
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+            ${{ env.TF_WORKING_DIR }}/.terraform
+          key: ${{ runner.os }}-tf-${{ hashFiles(format('{0}/**/*.tf', env.TF_WORKING_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-tf-
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+            role-to-assume: arn:aws:iam::${{ steps.sts-account.outputs.account_id || '' }}:role/github-actions-terraform
+            aws-region: ${{ env.AWS_REGION }}
+        env:
+          # We need ACCOUNT ID in the assumed role ARN; derive it first (cheap STS call)
+          AWS_REGION: ${{ env.AWS_REGION }}
+        continue-on-error: true  # will be reconfigured below with ACCOUNT_ID
+
+      - name: Discover AWS Account ID (STS)
+        id: sts
+        run: |
+          set -e
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "account_id=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Re-configure AWS credentials with discovered Account ID
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ steps.sts.outputs.account_id }}:role/github-actions-terraform
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+      - name: Terraform Fmt (check)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Plan
+        if: |
+          github.event_name == 'pull_request' ||
+          (github.event_name == 'workflow_dispatch' && inputs.action == 'plan') ||
+          (github.event_name == 'push') # always plan on push
+        id: plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          set -e
+          OUT="plan.out"
+          terraform plan -input=false -no-color -out "$OUT" | tee plan.txt
+          terraform show -no-color plan.out > plan_show.txt
+          echo "plan_path=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Plan Artifact
+        if: steps.plan.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ github.run_id }}
+          path: |
+            ${{ env.TF_WORKING_DIR }}/plan.out
+            ${{ env.TF_WORKING_DIR }}/plan.txt
+            ${{ env.TF_WORKING_DIR }}/plan_show.txt
+
+      - name: Terraform Apply (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'apply'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve
+
+      - name: Terraform Destroy (manual dispatch)
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -input=false -auto-approve
+
+      - name: Auto-Apply to prod on push to main (optional)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false -auto-approve
